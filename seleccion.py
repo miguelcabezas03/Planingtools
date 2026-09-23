@@ -7,6 +7,7 @@ seleccion.py — Módulo de negocio: Selección de Muestra.
 
 import math
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -44,6 +45,11 @@ CONFIG_SELECCION_DEFECTO: dict = {
     "limites_pais": {"lat": [-60.0, 35.0], "lon": [-120.0, -30.0]},
     "semilla": 2026,                    # null -> aleatorio en cada corrida
     "dbscan": {"eps": 0.01, "min_samples": 1},
+}
+
+PAISES_PROPORCION_4 = {
+    "COSTA RICA", "ECUADOR", "EL SALVADOR", "GUATEMALA ABVO",
+    "GUATEMALA EMBOCEN", "HONDURAS", "NICARAGUA", "PANAMÁ", "PANAMA",
 }
 
 
@@ -141,6 +147,9 @@ class ResultadoSeleccion:
     titulares: pd.DataFrame = field(default_factory=pd.DataFrame)
     suplentes: pd.DataFrame = field(default_factory=pd.DataFrame)
     universo_revisado: pd.DataFrame = field(default_factory=pd.DataFrame)
+    resumen_rutas: pd.DataFrame = field(default_factory=pd.DataFrame)
+    resumen_gec: pd.DataFrame = field(default_factory=pd.DataFrame)
+    resumen_canal: pd.DataFrame = field(default_factory=pd.DataFrame)
     metricas: dict = field(default_factory=dict)
     inicio: datetime = field(default_factory=datetime.now)
     duracion_seg: float = 0.0
@@ -194,6 +203,7 @@ class SelectorMuestra:
         self,
         progreso: ProgresoCallback | None = None,
         universo: pd.DataFrame | None = None,
+        fijos: pd.DataFrame | None = None,
     ) -> ResultadoSeleccion:
         avisar = progreso or (lambda p, m: None)
         t0 = time.perf_counter()
@@ -205,15 +215,16 @@ class SelectorMuestra:
         pais_act = getattr(self, "pais_activo", cfg.get("pais_activo", ""))
         res.pais_activo = pais_act
         cfg["pais_activo"] = pais_act
-        paises_exentos = ["REPÚBLICA DOMINICANA", "REPUBLICA DOMINICANA", "ECUADOR", "CHILE"]
-        res.nueva_regla = pais_act.strip().upper() not in paises_exentos
+        res.nueva_regla = pais_act.strip().upper() in PAISES_PROPORCION_4
         if res.nueva_regla:
             cfg["ratio_suplentes"] = 0
-            cfg["max_pdv_ruta"] = max(200, int(cfg.get("max_pdv_ruta", 200)))
+        cfg["min_pdv_ruta"] = max(10, int(cfg.get("min_pdv_ruta", 10)))
+        cfg["max_pdv_ruta"] = max(10, int(cfg.get("max_pdv_ruta", 10)))
         res.pais_activo = pais_act
         uni = universo.copy() if universo is not None else self.cargar_universo()
         uni.columns = [c.strip() if isinstance(c, str) else c for c in uni.columns]
         self._resolver_columnas_configuradas(uni)
+        uni = self._incorporar_fijos(uni, fijos)
 
         faltantes = [c for c in (cfg.get("columna_gec"), cfg.get("columna_lat"), cfg.get("columna_lon")) if c and c not in uni.columns]
         if cfg.get("columna_ruta") and cfg["columna_ruta"] not in uni.columns:
@@ -227,9 +238,18 @@ class SelectorMuestra:
             log.warning("Selección: no hay 'Cupo_Restante'; prioridad uniforme.")
             uni["Cupo_Restante"] = 1
         res.universo_revisado = uni.copy()
+        res.universo_revisado["seleccion"] = ""
 
         estado = normalizar_llave(uni["ELEGIBLE"])
-        uni_elegible = uni.loc[estado == "ELEGIBLE"].copy()
+        col_fijo = cfg.get("columna_fijo")
+        es_fijo = (
+            uni["_FIJO_ARCHIVO"].astype(bool)
+            if fijos is not None else
+            self._normalizar_tipo(uni[col_fijo]) == "FIJO"
+            if col_fijo in uni.columns else pd.Series(False, index=uni.index)
+        )
+        # El archivo de Fijos es la lista obligatoria que sube el usuario.
+        uni_elegible = uni.loc[(estado == "ELEGIBLE") | es_fijo].copy()
         if uni_elegible.empty:
             raise ErrorSeleccion(
                 "No quedaron puntos ELEGIBLES después de la revisión geográfica y la regla PXR."
@@ -242,9 +262,10 @@ class SelectorMuestra:
             uni_elegible[cfg["columna_lat"]], uni_elegible[cfg["columna_lon"]], limites
         )
         sin_gps = int(uni_elegible["_LAT"].isna().sum())
-        log.info("Selección: %s tiendas sin GPS válido (no seleccionables).",
+        log.info("Selección: %s tiendas sin GPS válido (solo los fijos son seleccionables).",
                  f"{sin_gps:,}")
-        pool = uni_elegible[uni_elegible["_LAT"].notna()].copy()
+        con_gps = uni_elegible["_LAT"].notna() & uni_elegible["_LON"].notna()
+        pool = uni_elegible.loc[con_gps].copy()
         pool["_GEC"] = normalizar_llave(pool[cfg["columna_gec"]])
         
         if cfg.get("columna_ruta") and cfg["columna_ruta"] in pool.columns:
@@ -263,20 +284,39 @@ class SelectorMuestra:
             if minimo_base > 1:
                 tamanos_ruta = pool.groupby("_RUTA")["_RUTA"].transform("size")
                 descartados = int((tamanos_ruta < minimo_base).sum())
-                pool = pool.loc[tamanos_ruta >= minimo_base].copy()
+                pool = pool.loc[(tamanos_ruta >= minimo_base) | es_fijo.reindex(pool.index, fill_value=False)].copy()
                 log.info(
                     "Selección: %s puntos retirados de rutas con menos de %s PDV.",
                     f"{descartados:,}", minimo_base,
                 )
-        if pool.empty:
-            raise ErrorSeleccion("No quedaron puntos con GPS después del filtro mínimo por ruta.")
-
         avisar(0.24, "Clusterizando puntos y calculando densidad...")
-        pool = self._preparar_clusterizacion(pool)
+        pool = self._preparar_clusterizacion(pool) if not pool.empty else pool
+        fijos_sin_gps = uni_elegible.loc[~con_gps & es_fijo.reindex(uni_elegible.index, fill_value=False)].copy()
+        if not fijos_sin_gps.empty:
+            fijos_sin_gps["_GEC"] = normalizar_llave(fijos_sin_gps[cfg["columna_gec"]])
+            columna_ruta = cfg.get("columna_ruta") or cfg.get("columna_agencia")
+            fijos_sin_gps["_RUTA"] = normalizar_llave(fijos_sin_gps[columna_ruta]) if columna_ruta in fijos_sin_gps else "R1"
+            fijos_sin_gps["_CANAL"] = (
+                self._normalizar_canal(fijos_sin_gps[cfg["columna_canal"]])
+                if cfg.get("columna_canal") in fijos_sin_gps.columns else ""
+            )
+            fijos_sin_gps["_TIPO"] = "FIJO"
+            fijos_sin_gps["CLUSTER"] = -1
+            fijos_sin_gps["DENSIDAD"] = 0
+            fijos_sin_gps["_PUNTAJE_CLUSTER"] = 0.0
+            fijos_sin_gps["PESO_CELDA_NORM"] = 0.0
+            pool = pd.concat([pool, fijos_sin_gps], axis=0)
+        pool["_FIJO_FORZADO"] = es_fijo.reindex(pool.index, fill_value=False).astype(bool)
+        if fijos is not None:
+            pool["_TIPO"] = np.where(pool["_FIJO_FORZADO"], "FIJO", "VARIABLE")
+        if pool.empty:
+            raise ErrorSeleccion("No hay puntos seleccionables ni fijos cargados.")
 
         # 3) Titulares --------------------------------------------------------
         avisar(0.30, "Seleccionando titulares (T)...")
         titulares = self._seleccionar_titulares(pool)
+        res.universo_revisado.loc[titulares.index, "seleccion"] = "T"
+        res.resumen_rutas, res.resumen_gec, res.resumen_canal = self._resumenes_seleccion(pool, titulares)
 
         # 4) Dispersión -------------------------------------------------------
         avisar(0.60, "Calculando dispersión (distancias entre T)...")
@@ -292,14 +332,48 @@ class SelectorMuestra:
         res.suplentes = self._presentar(suplentes, es_titular=False)
         res.duracion_seg = time.perf_counter() - t0
         res.metricas = self._metricas(uni_elegible, pool, res, sin_gps)
+        res.metricas["Fijos sin GPS incluidos"] = len(fijos_sin_gps)
         return res
+
+    def _incorporar_fijos(self, universo: pd.DataFrame, fijos: pd.DataFrame | None) -> pd.DataFrame:
+        """Marca por código todos los fijos cargados y agrega los ausentes."""
+        out = universo.reset_index(drop=True).copy()
+        out["_FIJO_ARCHIVO"] = False
+        if fijos is None or fijos.empty:
+            return out
+        fijos = fijos.copy()
+        fijos.columns = [c.strip() if isinstance(c, str) else c for c in fijos.columns]
+        codigo = self.cfg.get("llave_universo") or self.cfg.get("columna_codigo")
+        candidatos = [codigo, "COD D&N", "Codigo D&N", "CÓDIGO", "CODIGO", "Codigo", "RefID", "RefIDEmbotellador"]
+        col_uni = resolver_columna(out, [nombre for nombre in candidatos if nombre])
+        col_fijos = resolver_columna(fijos, [nombre for nombre in [col_uni] + candidatos if nombre])
+        if not col_uni or not col_fijos:
+            raise ErrorSeleccion("El archivo Fijos requiere la columna de código configurada en el universo.")
+        cod_uni = normalizar_llave(out[col_uni])
+        cod_fijos = normalizar_llave(fijos[col_fijos])
+        if cod_fijos.eq("").any():
+            raise ErrorSeleccion("Hay puntos en el archivo Fijos sin código; no se pueden identificar todos.")
+        fijos = fijos.loc[~cod_fijos.duplicated()].copy()
+        cod_fijos = cod_fijos.loc[fijos.index]
+        out.loc[cod_uni.isin(set(cod_fijos)), "_FIJO_ARCHIVO"] = True
+        faltantes = fijos.loc[~cod_fijos.isin(set(cod_uni))].copy()
+        if not faltantes.empty:
+            if col_fijos != col_uni:
+                faltantes[col_uni] = faltantes[col_fijos]
+            faltantes["_FIJO_ARCHIVO"] = True
+            faltantes.index = range(len(out), len(out) + len(faltantes))
+            out = pd.concat([out, faltantes], axis=0)
+        col_tipo = self.cfg.get("columna_fijo")
+        if col_tipo:
+            out.loc[out["_FIJO_ARCHIVO"], col_tipo] = self.cfg.get("valor_fijo", "SI")
+        return out
 
     def _aplicar_regla_pxr(self, universo: pd.DataFrame) -> pd.DataFrame:
         """Agrega PXR (conteo de código por ruta) y excluye grupos pequeños."""
         out = universo.copy()
         cfg = self.cfg
         self._resolver_columnas_configuradas(out)
-        columna_ruta = cfg.get("columna_ruta")
+        columna_ruta = cfg.get("columna_ruta") or cfg.get("columna_agencia")
         if not columna_ruta or columna_ruta not in out.columns:
             raise ErrorSeleccion(
                 f"No se encontró la columna de ruta configurada: '{columna_ruta}'."
@@ -320,11 +394,13 @@ class SelectorMuestra:
         except (TypeError, ValueError):
             minimo = 10
         elegible = normalizar_llave(out["ELEGIBLE"]) == "ELEGIBLE"
+        obligatorios = out.get("_FIJO_ARCHIVO", pd.Series(False, index=out.index)).fillna(False).astype(bool)
+        contables = elegible | obligatorios
         agrupador = out[columna_ruta].fillna("(SIN RUTA)").astype(str)
         out["PXR"] = pd.Series(0, index=out.index, dtype="Int64")
-        if elegible.any():
-            universo_elegible = out.loc[elegible]
-            grupos_elegibles = agrupador.loc[elegible]
+        if contables.any():
+            universo_elegible = out.loc[contables]
+            grupos_elegibles = agrupador.loc[contables]
             if columna_codigo:
                 conteos = universo_elegible.groupby(
                     grupos_elegibles, dropna=False
@@ -336,7 +412,7 @@ class SelectorMuestra:
                 conteos = universo_elegible.groupby(
                     grupos_elegibles, dropna=False
                 )[columna_ruta].transform("size")
-            out.loc[elegible, "PXR"] = conteos.astype("Int64")
+            out.loc[contables, "PXR"] = conteos.astype("Int64")
 
         excluir = elegible & (out["PXR"] < minimo)
         out.loc[excluir, "ELEGIBLE"] = f"NO ELEGIBLE PXR <{minimo}"
@@ -458,11 +534,13 @@ class SelectorMuestra:
         cfg, log = self.cfg, self.log
         
         pais_act = cfg.get("pais_activo", "").strip().upper()
-        paises_exentos = ["REPÚBLICA DOMINICANA", "REPUBLICA DOMINICANA", "ECUADOR", "CHILE"]
-        nueva_regla = pais_act not in paises_exentos
+        # La proporción x4 usa el motor heurístico; este solver conserva el
+        # modelo histórico para los llamados directos y Chile/RD.
+        nueva_regla = pais_act not in {"REPÚBLICA DOMINICANA", "REPUBLICA DOMINICANA", "ECUADOR", "CHILE"}
         
         tamano_base = int(cfg.get("tamano_muestra", len(pool)))
-        n_total = tamano_base * 4 if nueva_regla else tamano_base
+        fijos_obligatorios = pool.get("_FIJO_FORZADO", pd.Series(False, index=pool.index)).fillna(False)
+        n_total = max(tamano_base * 4 if nueva_regla else tamano_base, int(fijos_obligatorios.sum()))
         
         # 1. Preparar solver SCIP
         solver = pywraplp.Solver.CreateSolver("SCIP")
@@ -476,6 +554,8 @@ class SelectorMuestra:
         
         # Variables de decisión binarias por PDV
         x = {i: solver.IntVar(0, 1, f"x_{i}") for i in pool.index}
+        for i in pool.index[fijos_obligatorios]:
+            solver.Add(x[i] == 1)
         
         # Restricción 1: Tamaño Total Muestra
         if nueva_regla:
@@ -513,7 +593,7 @@ class SelectorMuestra:
         # Restricción 4: Cuotas Tipo/Fijo (FIJO / VARIABLE)
         cuotas_tipo = cfg.get("cuotas_tipo", {})
         col_fijo = cfg.get("columna_fijo")
-        if col_fijo and col_fijo in pool.columns:
+        if col_fijo and col_fijo in pool.columns and not fijos_obligatorios.any():
             for cat, val in cuotas_tipo.items():
                 cat_n = self._normalizar_tipo(pd.Series([cat])).iloc[0]
                 idx_t = pool.index[pool["_TIPO"] == cat_n].tolist()
@@ -592,15 +672,13 @@ class SelectorMuestra:
             maxr = int(cfg.get("max_pdv_ruta", 200))
             rutas_grouped = pool.groupby("_RUTA").groups
             for r_name, r_indices in rutas_grouped.items():
-                if pais_act in {"CHILE", "REPÚBLICA DOMINICANA", "REPUBLICA DOMINICANA"}:
-                    # Los notebooks obligan a que toda ruta previamente
-                    # filtrada aporte entre el mínimo y el máximo.
-                    solver.Add(solver.Sum(x[i] for i in r_indices) >= minr)
-                    solver.Add(solver.Sum(x[i] for i in r_indices) <= maxr)
-                elif len(r_indices) >= minr:
-                    y_r = solver.IntVar(0, 1, f"y_{r_name}")
-                    solver.Add(solver.Sum(x[i] for i in r_indices) >= minr * y_r)
-                    solver.Add(solver.Sum(x[i] for i in r_indices) <= maxr * y_r)
+                n_fijos = int(fijos_obligatorios.loc[r_indices].sum())
+                y_r = solver.IntVar(0, 1, f"y_{len(str(r_name))}_{str(r_name)}")
+                if n_fijos:
+                    solver.Add(y_r == 1)
+                minimo_factible = min(minr, len(r_indices)) if n_fijos else minr
+                solver.Add(solver.Sum(x[i] for i in r_indices) >= minimo_factible * y_r)
+                solver.Add(solver.Sum(x[i] for i in r_indices) <= max(maxr, n_fijos) * y_r)
 
         # Función Objetivo Multi-etapa (Maximizar Fijos + Peso Celda / Densidad)
         peso_norm = pool.get("PESO_CELDA_NORM", pd.Series(1.0, index=pool.index))
@@ -645,10 +723,12 @@ class SelectorMuestra:
     def _seleccionar_titulares(self, pool: pd.DataFrame) -> pd.DataFrame:
         cfg, log = self.cfg, self.log
         pais_act = cfg.get("pais_activo", "").strip().upper()
-        paises_exentos = ["REPÚBLICA DOMINICANA", "REPUBLICA DOMINICANA", "ECUADOR", "CHILE"]
-        nueva_regla = pais_act not in paises_exentos
+        nueva_regla = pais_act in PAISES_PROPORCION_4
+        if nueva_regla:
+            return self._seleccionar_titulares_proporcion(pool)
         tamano_base = int(cfg["tamano_muestra"])
-        n_total = tamano_base * 4 if nueva_regla else tamano_base
+        fijos_obligatorios = pool["_FIJO_FORZADO"].fillna(False) | pool["_TIPO"].eq("FIJO")
+        n_total = max(tamano_base, int(fijos_obligatorios.sum()))
         
         # Intentar solver exacto ILP OR-Tools SCIP de ASIGNACIONES primero
         res_ortools = self._seleccionar_titulares_ortools(pool)
@@ -660,22 +740,17 @@ class SelectorMuestra:
                 return res_ortools
         minr, maxr = int(cfg["min_pdv_ruta"]), int(cfg["max_pdv_ruta"])
         if len(pool) < n_total:
-            if nueva_regla:
-                log.warning(f"Universo elegible ({len(pool):,}) es menor al objetivo x4 ({n_total:,}). Tomando todo.")
-                n_total = len(pool)
-            else:
-                raise ErrorSeleccion(
-                    f"El universo elegible con GPS ({len(pool):,}) es menor que la "
-                    f"muestra solicitada ({n_total:,})."
-                )
+            log.warning("El universo disponible (%s) es menor que la muestra solicitada (%s); se tomarán los disponibles.", len(pool), n_total)
+            n_total = len(pool)
 
         # Fijos obligatorios y Prioritarios ----------------------------------
-        col_f = cfg["columna_fijo"]
+        col_f = cfg.get("columna_fijo")
         if col_f in pool.columns:
             es_fijo = self._normalizar_tipo(pool[col_f]) == "FIJO"
         else:
             es_fijo = pool.get("Es_Fijo", pd.Series(False, index=pool.index))
             es_fijo = es_fijo.fillna(False).astype(bool)
+        es_fijo |= pool["_FIJO_FORZADO"].fillna(False)
         fijos = pool[es_fijo].copy()
 
         codigos_prio = cfg.get("codigos_prioritarios", [])
@@ -690,11 +765,7 @@ class SelectorMuestra:
                 log.info("Titulares prioritarios forzados (%s): %s", len(set_prio), len(prioritarios))
                 fijos = pd.concat([fijos, prioritarios]).drop_duplicates()
         if len(fijos) > n_total:
-            log.warning("Más fijos (%s) que muestra (%s); se toman los de "
-                        "mayor Cupo_Restante y densidad.", len(fijos), n_total)
-            fijos = fijos.sort_values(
-                ["Cupo_Restante", "_PUNTAJE_CLUSTER"], ascending=[False, False]
-            ).head(n_total)
+            n_total = len(fijos)
         log.info("Titulares fijos obligatorios: %s", f"{len(fijos):,}")
         resto = pool[~pool.index.isin(fijos.index)]
 
@@ -714,9 +785,8 @@ class SelectorMuestra:
             objetivo_gec[gec] = max(0, objetivo_gec.get(gec, 0) - int(k))
         log.info("Cuota restante por GEC (tras fijos): %s", objetivo_gec)
 
-        titulares = pd.concat(
-            [fijos, self._llenar_rutas(resto, cupos_ruta, objetivo_gec)]
-        )
+        adicionales = self._llenar_rutas(resto, cupos_ruta, objetivo_gec)
+        titulares = pd.concat([fijos, adicionales])
 
         conteo = titulares["_RUTA"].value_counts()
         log.info(
@@ -725,6 +795,164 @@ class SelectorMuestra:
             conteo.mean(), int(conteo.max()),
         )
         return titulares
+
+    def _seleccionar_titulares_proporcion(self, pool: pd.DataFrame) -> pd.DataFrame:
+        """Apunta a PP=4 por GEC y canal; PP=6 es el techo de compensación.
+
+        Los fijos cargados siempre entran. Se completan primero sus rutas y
+        luego se abren rutas compactas de 10+ puntos, respetando su máximo.
+        """
+        cfg = self.cfg
+        base_total = int(cfg.get("tamano_muestra", 0))
+        cuotas_gec = self._cuotas_base(cfg.get("cuotas_gec", {}), base_total)
+        cuotas_canal = {
+            self._normalizar_canal(pd.Series([k])).iloc[0]: v
+            for k, v in self._cuotas_base(cfg.get("cuotas_canal", {}), base_total).items()
+        }
+        if not cuotas_gec:
+            raise ErrorSeleccion("Configure las cuotas GEC antes de seleccionar la muestra.")
+        tiene_canal = bool(cfg.get("columna_canal") in pool.columns and cuotas_canal)
+        disponibles_gec = Counter(pool["_GEC"])
+        disponibles_canal = Counter(pool["_CANAL"])
+        ideal_gec = {k: min(4 * v, disponibles_gec[k]) for k, v in cuotas_gec.items()}
+        ideal_canal = {k: min(4 * v, disponibles_canal[k]) for k, v in cuotas_canal.items()} if tiene_canal else {}
+        max_gec = {k: 6 * v for k, v in cuotas_gec.items()}
+        max_canal = {k: 6 * v for k, v in cuotas_canal.items()} if tiene_canal else {}
+        base_total = base_total or sum(cuotas_gec.values())
+
+        forzados = pool["_FIJO_FORZADO"].fillna(False) | pool["_TIPO"].eq("FIJO")
+        codigos_prio = cfg.get("codigos_prioritarios") or []
+        if codigos_prio:
+            col_codigo = next((c for c in (cfg.get("llave_universo"), "CÓDIGO", "CODIGO", "Codigo", "RefIDEmbotellador") if c in pool.columns), None)
+            if col_codigo:
+                forzados |= normalizar_llave(pool[col_codigo]).isin({str(c).strip() for c in codigos_prio})
+        elegidos = set(pool.index[forzados])
+        conteo_gec = Counter(pool.loc[list(elegidos), "_GEC"])
+        conteo_canal = Counter(pool.loc[list(elegidos), "_CANAL"])
+        conteo_ruta = Counter(pool.loc[list(elegidos), "_RUTA"])
+        max_total = max(6 * base_total, len(elegidos))
+        minimo_ruta = 10
+        maximo_ruta = max(minimo_ruta, int(cfg.get("max_pdv_ruta", 10)))
+        rutas: dict[str, pd.DataFrame] = {}
+        dispersion_ruta: dict[str, float] = {}
+        for ruta, sub in pool.groupby("_RUTA", sort=True, dropna=False):
+            # Mantener solo las columnas usadas por el heurístico evita
+            # duplicar universos anchos en el servidor gratuito.
+            sub = sub[["_GEC", "_CANAL", "_LAT", "_LON"]].copy()
+            puntos_validos = sub.loc[sub["_LAT"].notna() & sub["_LON"].notna()]
+            if puntos_validos.empty:
+                sub["_DIST_ANCLA"] = np.inf
+                dispersion_ruta[ruta] = np.inf
+            else:
+                fijos_validos = puntos_validos.loc[puntos_validos.index.isin(elegidos)]
+                if not fijos_validos.empty:
+                    anclas = fijos_validos[["_LAT", "_LON"]].to_numpy(float)
+                    distancias = cKDTree(anclas).query(puntos_validos[["_LAT", "_LON"]].to_numpy(float))[0]
+                    sub["_DIST_ANCLA"] = pd.Series(distancias, index=puntos_validos.index).reindex(sub.index).fillna(np.inf)
+                else:
+                    lat_centro = float(puntos_validos["_LAT"].median())
+                    lon_centro = float(puntos_validos["_LON"].median())
+                    distancias = haversine_km(
+                        puntos_validos["_LAT"].to_numpy(float), puntos_validos["_LON"].to_numpy(float),
+                        np.float64(lat_centro), np.float64(lon_centro),
+                    )
+                    sub["_DIST_ANCLA"] = pd.Series(distancias, index=puntos_validos.index).reindex(sub.index).fillna(np.inf)
+                dispersion_ruta[ruta] = float(sub["_DIST_ANCLA"].replace(np.inf, np.nan).median())
+            rutas[ruta] = sub
+
+        def faltan_cuotas() -> bool:
+            return any(conteo_gec[k] < objetivo for k, objetivo in ideal_gec.items()) or (
+                tiene_canal and any(conteo_canal[k] < objetivo for k, objetivo in ideal_canal.items())
+            )
+
+        def mejor(ruta: str, locales: set, gec_local: Counter, canal_local: Counter, completar_minimo: bool):
+            opciones = []
+            for indice, fila in rutas[ruta].iterrows():
+                if indice in locales:
+                    continue
+                gec, canal = fila["_GEC"], fila["_CANAL"]
+                if gec not in max_gec or gec_local[gec] >= max_gec[gec]:
+                    continue
+                if tiene_canal and (canal not in max_canal or canal_local[canal] >= max_canal[canal]):
+                    continue
+                falta_gec = max(0, ideal_gec[gec] - gec_local[gec]) / max(1, ideal_gec[gec])
+                falta_canal = max(0, ideal_canal[canal] - canal_local[canal]) / max(1, ideal_canal[canal]) if tiene_canal else 0
+                if not completar_minimo and falta_gec == 0 and falta_canal == 0:
+                    continue
+                opciones.append(((int(falta_gec > 0) + int(falta_canal > 0), falta_gec + falta_canal,
+                                  -float(fila["_DIST_ANCLA"])), indice))
+            return max(opciones)[1] if opciones else None
+
+        def agregar(indice) -> None:
+            elegidos.add(indice)
+            fila = pool.loc[indice]
+            conteo_gec[fila["_GEC"]] += 1
+            conteo_canal[fila["_CANAL"]] += 1
+            conteo_ruta[fila["_RUTA"]] += 1
+
+        # Rutas con fijos: se completa el mínimo si hay oferta y margen PP.
+        for ruta in sorted(conteo_ruta, key=lambda r: str(r)):
+            if len(rutas[ruta]) < minimo_ruta:
+                continue
+            while conteo_ruta[ruta] < minimo_ruta and len(elegidos) < max_total:
+                indice = mejor(ruta, elegidos, conteo_gec, conteo_canal, True)
+                if indice is None:
+                    break
+                agregar(indice)
+
+        def llenar_activa(ruta: str) -> None:
+            limite = max(maximo_ruta, int(forzados.loc[rutas[ruta].index].sum()))
+            while conteo_ruta[ruta] < limite and len(elegidos) < max_total and faltan_cuotas():
+                indice = mejor(ruta, elegidos, conteo_gec, conteo_canal, False)
+                if indice is None:
+                    break
+                agregar(indice)
+
+        for ruta in sorted(conteo_ruta, key=lambda r: (dispersion_ruta.get(r, np.inf), str(r))):
+            llenar_activa(ruta)
+
+        # Elegir primero rutas con puntos cercanos; nunca abrir una ruta que
+        # pudiera quedar bajo 10 si hay otra ruta completa disponible.
+        pendientes = sorted(
+            (ruta for ruta in rutas if ruta not in conteo_ruta and len(rutas[ruta]) >= minimo_ruta),
+            key=lambda r: (dispersion_ruta[r], str(r)),
+        )
+        for ruta in pendientes:
+            if not faltan_cuotas() or len(elegidos) >= max_total:
+                break
+            locales = set(elegidos)
+            gec_local, canal_local = conteo_gec.copy(), conteo_canal.copy()
+            lote = []
+            for _ in range(minimo_ruta):
+                indice = mejor(ruta, locales, gec_local, canal_local, True)
+                if indice is None:
+                    break
+                locales.add(indice)
+                lote.append(indice)
+                fila = pool.loc[indice]
+                gec_local[fila["_GEC"]] += 1
+                canal_local[fila["_CANAL"]] += 1
+            if len(lote) < minimo_ruta or len(elegidos) + len(lote) > max_total:
+                continue
+            for indice in lote:
+                agregar(indice)
+            llenar_activa(ruta)
+
+        # Solo si no queda ninguna ruta de 10 que ayude a las cuotas se usan
+        # rutas cortas para acercarse a la proporción objetivo.
+        if faltan_cuotas() and len(elegidos) < max_total:
+            for ruta in sorted((r for r in rutas if r not in conteo_ruta), key=lambda r: (dispersion_ruta[r], str(r))):
+                while conteo_ruta[ruta] < min(len(rutas[ruta]), maximo_ruta) and faltan_cuotas() and len(elegidos) < max_total:
+                    indice = mejor(ruta, elegidos, conteo_gec, conteo_canal, False)
+                    if indice is None:
+                        break
+                    agregar(indice)
+
+        if not elegidos:
+            raise ErrorSeleccion("No hay puntos que cumplan las cuotas GEC y canal configuradas.")
+        seleccion = pool.loc[pool.index.isin(elegidos)].copy()
+        self.log.info("Proporción 4: %s titulares, %s fijos, %s rutas.", len(seleccion), int(forzados.sum()), len(conteo_ruta))
+        return seleccion
 
     def _elegir_rutas(
         self, resto: pd.DataFrame, fijos: pd.DataFrame, n_total: int
@@ -882,7 +1110,7 @@ class SelectorMuestra:
                 "Cuotas GEC con déficit tras el llenado por rutas: %s "
                 "(cubierto con otros GEC dentro de la tolerancia).", sobra,
             )
-        out = pd.concat(tomados).drop(columns="_azar")
+        out = pd.concat(tomados).drop(columns="_azar") if tomados else resto.iloc[:0].copy()
         return out
 
     @staticmethod
@@ -902,12 +1130,13 @@ class SelectorMuestra:
     # ----------------------------------------------------------- dispersión --
     def _calcular_dispersion(self, t: pd.DataFrame) -> pd.DataFrame:
         """Distancia de cada titular al titular más cercano (km)."""
-        lat = t["_LAT"].to_numpy(float)
-        lon = t["_LON"].to_numpy(float)
         t = t.copy()
-        if len(t) < 2:
-            distancias = np.full(len(t), np.inf)
-        else:
+        t["Dist_T_Cercano_km"] = np.nan
+        con_gps = t["_LAT"].notna() & t["_LON"].notna()
+        validos = t.loc[con_gps]
+        if len(validos) >= 2:
+            lat = validos["_LAT"].to_numpy(float)
+            lon = validos["_LON"].to_numpy(float)
             # La cuerda de una esfera y la distancia haversine tienen el mismo
             # orden. El árbol encuentra el vecino sin crear una matriz N×N.
             lat_rad = np.radians(lat)
@@ -918,10 +1147,12 @@ class SelectorMuestra:
                 np.sin(lat_rad),
             ))
             vecinos = cKDTree(puntos).query(puntos, k=2)[1]
-            indices = np.arange(len(t))
+            indices = np.arange(len(validos))
             cercanos = np.where(vecinos[:, 0] == indices, vecinos[:, 1], vecinos[:, 0])
             distancias = haversine_km(lat, lon, lat[cercanos], lon[cercanos])
-        t["Dist_T_Cercano_km"] = np.round(distancias, 3)
+            t.loc[con_gps, "Dist_T_Cercano_km"] = np.round(distancias, 3)
+        elif len(validos) == 1:
+            t.loc[con_gps, "Dist_T_Cercano_km"] = np.inf
         self.log.info(
             "Dispersión: distancia al T más cercano — mín %.3f km, "
             "mediana %.3f km, promedio %.3f km.",
@@ -952,6 +1183,8 @@ class SelectorMuestra:
 
         por_gec = {g: sub for g, sub in disponibles.groupby("_GEC")}
         for idx, fila in t.iterrows():
+            if pd.isna(fila["_LAT"]) or pd.isna(fila["_LON"]):
+                continue
             cand = por_gec.get(fila["_GEC"])
             if cand is None or cand.empty:
                 continue
@@ -994,7 +1227,58 @@ class SelectorMuestra:
             if c in out.columns
         ])
         out.insert(0, "Tipo", "TITULAR" if es_titular else "SUPLENTE")
+        out["seleccion"] = "T" if es_titular else ""
         return out.reset_index(drop=True)
+
+    def _resumenes_seleccion(
+        self, pool: pd.DataFrame, titulares: pd.DataFrame,
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        """Resume rutas y la proporción real seleccionada/base por segmento."""
+        rutas = titulares.groupby("_RUTA", dropna=False).agg(
+            **{"Puntos seleccionados": ("_RUTA", "size"),
+               "Fijos seleccionados": ("_TIPO", lambda valores: int((valores == "FIJO").sum()))}
+        ).reset_index(names="Ruta").sort_values("Ruta")
+        disponibles = pool.groupby("_RUTA", dropna=False).size()
+        rutas["Elegibles disponibles"] = rutas["Ruta"].map(disponibles).astype(int)
+        rutas["Meta mínima"] = 10
+        rutas["Estado"] = np.where(
+            rutas["Puntos seleccionados"] >= 10, "Cumple",
+            np.where(rutas["Elegibles disponibles"] < 10, "Sin suficientes elegibles", "Por completar"),
+        )
+
+        def tabla(columna: str, cuotas: dict) -> pd.DataFrame:
+            base = self._cuotas_base(cuotas, int(self.cfg.get("tamano_muestra", 0)))
+            if columna == "_CANAL":
+                base = {self._normalizar_canal(pd.Series([clave])).iloc[0]: valor for clave, valor in base.items()}
+            conteos = titulares[columna].value_counts()
+            categorias = list(base) + [valor for valor in conteos.index if valor not in base]
+            filas = []
+            for categoria in categorias:
+                cantidad = int(conteos.get(categoria, 0))
+                muestra = base.get(categoria)
+                filas.append({
+                    "Etiquetas de fila": categoria,
+                    "Cuenta de RefID": cantidad,
+                    "M": muestra,
+                    "PP": round(cantidad / muestra, 1) if muestra else None,
+                })
+            filas.append({
+                "Etiquetas de fila": "Total general",
+                "Cuenta de RefID": int(len(titulares)),
+                "M": sum(base.values()),
+                "PP": round(len(titulares) / sum(base.values()), 1) if sum(base.values()) else None,
+            })
+            return pd.DataFrame(filas)
+
+        return rutas, tabla("_GEC", self.cfg.get("cuotas_gec", {})), tabla("_CANAL", self.cfg.get("cuotas_canal", {}))
+
+    @staticmethod
+    def _cuotas_base(cuotas: dict, tamano_base: int) -> dict[str, int]:
+        """Convierte cuotas porcentuales (Ecuador) a cantidades base enteras."""
+        valores = {str(k).strip().upper(): float(v) for k, v in cuotas.items()}
+        if valores and all(0 <= valor <= 1 for valor in valores.values()):
+            return SelectorMuestra._repartir(tamano_base, valores)
+        return {clave: int(round(valor)) for clave, valor in valores.items()}
 
     def _metricas(self, uni, pool, res: ResultadoSeleccion, sin_gps: int) -> dict:
         cfg = self.cfg
@@ -1004,7 +1288,8 @@ class SelectorMuestra:
             if len(t) else pd.Series(dtype="object")
         )
         conteos_gec = gec_normalizado.value_counts()
-        rutas = t[cfg["columna_ruta"]].value_counts() if len(t) else pd.Series(dtype=int)
+        columna_ruta = cfg.get("columna_ruta") or cfg.get("columna_agencia")
+        rutas = t[columna_ruta].value_counts() if len(t) and columna_ruta in t else pd.Series(dtype=int)
 
         out_metrics = {
             "Universo elegible de entrada": len(uni),

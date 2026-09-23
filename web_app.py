@@ -395,8 +395,8 @@ def page_configuration() -> None:
         st.caption("Los Excel se mantienen en la memoria temporal de esta sesión web; no se guardan como archivos permanentes.")
     with right, st.container(border=True):
         card_title("Puntos de Rutas y Cluster")
-        int_parameter(sel, "min_pdv_ruta", "Min de Ruta", country, "sel")
-        int_parameter(sel, "max_pdv_ruta", "Max de Ruta", country, "sel")
+        int_parameter(sel, "min_pdv_ruta", "Min de Ruta", country, "sel", minimum=10, default=10)
+        int_parameter(sel, "max_pdv_ruta", "Max de Ruta", country, "sel", minimum=10, default=10)
         route_limits = sel.setdefault("puntos_rutas", {})
         int_parameter(route_limits, "max_diferencia_ruta", "Max dif. de Ruta", country, "route")
         int_parameter(route_limits, "min_ruta_base", "Min Ruta de Base", country, "route")
@@ -699,13 +699,23 @@ def page_selection() -> None:
                 selector = SelectorMuestra(Path(temp), copy.deepcopy(cfg["paises"][country]["modulo_seleccion"]))
                 selector.pais_activo = country
                 bar = st.progress(0, text="Preparando muestra...")
-                result = selector.ejecutar(progress_callback(bar), universo=universe)
+                dep_cfg = cfg["paises"][country]["modulo_depuracion"]
+                selector.cfg["llave_universo"] = dep_cfg.get("llave_universo")
+                fixed_record = country_workbooks(country).get("fixed")
+                fixed_frame = (
+                    pd.read_excel(io.BytesIO(fixed_record["content"]), sheet_name=dep_cfg.get("rotacion", {}).get("hoja_fijos", 0))
+                    if fixed_record else None
+                )
+                result = selector.ejecutar(progress_callback(bar), universo=universe, fijos=fixed_frame)
                 temp_path = Path(temp)
                 selection_path = temp_path / "Seleccion.xlsx"
                 write_spreadsheet(selection_path, {
                     "Titulares": result.titulares,
                     "Suplentes": result.suplentes,
                     "Auditoria": pd.DataFrame(list(result.metricas.items()), columns=["Indicador", "Valor"]),
+                    "Rutas": result.resumen_rutas,
+                    "GEC": result.resumen_gec,
+                    "Canal": result.resumen_canal,
                 })
                 reviewed_path = temp_path / "Universo_Revisado.xlsx"
                 write_spreadsheet(reviewed_path, {"Universo": result.universo_revisado})
@@ -736,11 +746,16 @@ def page_selection() -> None:
             show_error(exc)
     result = st.session_state.get("sel_result") if st.session_state.get("sel_result_source_id") == source_id else None
     if result is not None:
-        st.dataframe(result.titulares.head(500), width="stretch")
-        sel_cfg = cfg["paises"][country]["modulo_seleccion"]
-        lat, lon = sel_cfg.get("columna_lat"), sel_cfg.get("columna_lon")
-        if lat in result.titulares and lon in result.titulares:
-            map_points(result.titulares, lat, lon, key="sel_map")
+        st.success(f"Resultado: {len(result.titulares):,} titulares · {len(result.suplentes):,} suplentes.")
+        st.subheader("Puntos seleccionados por ruta")
+        st.dataframe(result.resumen_rutas, width="stretch", hide_index=True)
+        izquierda, derecha = st.columns(2)
+        with izquierda:
+            st.subheader("Selección por GEC")
+            st.dataframe(result.resumen_gec, width="stretch", hide_index=True)
+        with derecha:
+            st.subheader("Selección por canal")
+            st.dataframe(result.resumen_canal, width="stretch", hide_index=True)
     if result is not None:
         download_result(
             "sel_xlsx", "Descargar Excel final de selección", "Seleccion.xlsx",
