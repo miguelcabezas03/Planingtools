@@ -229,6 +229,7 @@ class ReglaPXRTests(unittest.TestCase):
         resultado = selector.ejecutar(universo=universo)
         self.assertEqual(observados, ["A"])
         self.assertEqual(resultado.titulares["Codigo"].tolist(), ["A"])
+        self.assertEqual(selector.cfg["pais_activo"], "Chile")
 
 
 class ClusterizacionSeleccionTests(unittest.TestCase):
@@ -247,6 +248,11 @@ class ClusterizacionSeleccionTests(unittest.TestCase):
         titulares = pd.DataFrame({"_LAT": np.zeros(5000), "_LON": np.zeros(5000)})
         resultado = SelectorMuestra(Path("."), {})._calcular_dispersion(titulares)
         self.assertTrue((resultado["Dist_T_Cercano_km"] == 0).all())
+
+    def test_dispersion_con_un_solo_titular(self):
+        punto = pd.DataFrame({"_LAT": [0.0], "_LON": [0.0]})
+        resultado = SelectorMuestra(Path("."), {})._calcular_dispersion(punto)
+        self.assertTrue(np.isinf(resultado["Dist_T_Cercano_km"].iloc[0]))
 
     def test_dbscan_detecta_nucleo_y_ruido(self):
         etiquetas = dbscan_coordenadas(

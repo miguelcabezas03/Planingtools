@@ -5,12 +5,14 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 from server_config_store import load_configuration, save_configuration
 from web_workflow import (
     parse_priority_codes, safe_workbook_name, synchronize_country_parameters,
-    workbook_columns, workbook_record, write_workbook,
+    selection_source_options, workbook_columns, workbook_record, write_spreadsheet,
+    write_workbook,
 )
 
 
@@ -58,6 +60,24 @@ class WorkflowStateTests(unittest.TestCase):
 
     def test_priority_codes(self):
         self.assertEqual(parse_priority_codes("123, AB, 004, "), [123, "AB", 4])
+
+    def test_selection_only_offers_available_sources(self):
+        self.assertEqual(selection_source_options(False, False), [])
+        self.assertEqual(selection_source_options(True, False), ["Resultado de depuración"])
+        self.assertEqual(selection_source_options(False, True), ["Archivo cargado"])
+        self.assertEqual(
+            selection_source_options(True, True),
+            ["Resultado de depuración", "Archivo cargado"],
+        )
+
+    def test_streamed_selection_workbook_preserves_data(self):
+        data = pd.DataFrame({"Código": [1, 2], "GEC": ["ORO", "PLATA"], "GPS": [1.5, np.nan]})
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "Seleccion.xlsx"
+            write_spreadsheet(output, {"Titulares": data, "Suplentes": data.iloc[0:0]})
+            with pd.ExcelFile(output) as workbook:
+                self.assertEqual(workbook.sheet_names, ["Titulares", "Suplentes"])
+            pd.testing.assert_frame_equal(pd.read_excel(output, sheet_name="Titulares"), data)
 
     def test_shared_server_save_reload_and_conflict(self):
         with tempfile.TemporaryDirectory() as temp:

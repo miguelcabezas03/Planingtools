@@ -9,9 +9,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import io
+import math
+from datetime import date, datetime
 from pathlib import Path, PureWindowsPath
 
+import numpy as np
 import pandas as pd
+from openpyxl import Workbook
 
 
 def safe_workbook_name(name: str) -> str:
@@ -53,6 +57,40 @@ def write_workbook(record: dict, folder: Path) -> Path:
     target = folder / safe_workbook_name(record["name"])
     target.write_bytes(record["content"])
     return target
+
+
+def write_spreadsheet(path: Path, frames: dict[str, pd.DataFrame]) -> None:
+    """Escribe resultados Excel por filas para evitar acumular celdas en RAM."""
+    book = Workbook(write_only=True)
+    for name, frame in frames.items():
+        sheet = book.create_sheet(str(name)[:31])
+        sheet.append([str(column) for column in frame.columns])
+        for values in frame.itertuples(index=False, name=None):
+            row = []
+            for value in values:
+                if value is None or value is pd.NA:
+                    value = None
+                elif isinstance(value, (float, np.floating)) and not math.isfinite(value):
+                    value = str(value)
+                elif isinstance(value, np.generic):
+                    value = value.item()
+                elif isinstance(value, pd.Timestamp):
+                    value = value.to_pydatetime()
+                elif not isinstance(value, (str, int, float, bool, date, datetime)):
+                    value = str(value)
+                row.append(value)
+            sheet.append(row)
+    book.save(path)
+
+
+def selection_source_options(has_depuracion: bool, has_uploaded_file: bool) -> list[str]:
+    """Ofrece solo fuentes realmente disponibles, priorizando la depuración."""
+    options = []
+    if has_depuracion:
+        options.append("Resultado de depuración")
+    if has_uploaded_file:
+        options.append("Archivo cargado")
+    return options
 
 
 def parse_priority_codes(text: str) -> list[int | str]:

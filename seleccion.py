@@ -7,7 +7,6 @@ seleccion.py — Módulo de negocio: Selección de Muestra.
 
 import math
 import time
-from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +15,7 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 from ortools.linear_solver import pywraplp
+from scipy.spatial import cKDTree
 
 from logs import obtener_logger
 from normalizacion import normalizar_llave
@@ -100,12 +100,7 @@ def dbscan_coordenadas(
     eps: float,
     min_samples: int,
 ) -> np.ndarray:
-    """DBSCAN euclidiano en grados, equivalente al usado en los notebooks.
-
-    Usa una cuadrícula espacial interna para no construir una matriz de
-    distancias de N×N ni depender de SciPy. ``min_samples`` incluye el propio
-    punto, igual que scikit-learn.
-    """
+    """DBSCAN euclidiano sin almacenar todos los vecinos en memoria."""
     coordenadas = np.column_stack((latitud, longitud)).astype(float)
     if len(coordenadas) == 0:
         return np.empty(0, dtype=int)
@@ -114,41 +109,11 @@ def dbscan_coordenadas(
     if eps <= 0 or min_samples <= 0:
         raise ErrorSeleccion("DBSCAN requiere EPS y Min Samples mayores que cero.")
 
-    # Cada punto solo puede tener vecinos en su propia celda espacial o en
-    # una de las ocho adyacentes. Después se valida la distancia euclidiana
-    # exacta para conservar la semántica de DBSCAN de los notebooks.
-    tamano_celda = float(eps)
-    cubetas: defaultdict[tuple[int, int], list[int]] = defaultdict(list)
-    claves_celda: list[tuple[int, int]] = []
-    for indice, (lat, lon) in enumerate(coordenadas):
-        clave = (math.floor(lat / tamano_celda), math.floor(lon / tamano_celda))
-        claves_celda.append(clave)
-        cubetas[clave].append(indice)
-
-    radio_cuadrado = tamano_celda * tamano_celda
+    radio_cuadrado = float(eps) * float(eps)
     tolerancia = np.finfo(float).eps * max(1.0, radio_cuadrado) * 8
-    vecinos: list[list[int]] = []
-    for indice, (lat, lon) in enumerate(coordenadas):
-        celda_lat, celda_lon = claves_celda[indice]
-        candidatos: list[int] = []
-        for delta_lat in (-1, 0, 1):
-            for delta_lon in (-1, 0, 1):
-                candidatos.extend(
-                    cubetas.get((celda_lat + delta_lat, celda_lon + delta_lon), ())
-                )
-        cercanos = [
-            candidato
-            for candidato in candidatos
-            if (coordenadas[candidato, 0] - lat) ** 2
-            + (coordenadas[candidato, 1] - lon) ** 2
-            <= radio_cuadrado + tolerancia
-        ]
-        vecinos.append(sorted(cercanos))
-    es_nucleo = np.fromiter(
-        (len(indices) >= int(min_samples) for indices in vecinos),
-        dtype=bool,
-        count=len(coordenadas),
-    )
+    radio = math.sqrt(radio_cuadrado + tolerancia)
+    arbol = cKDTree(coordenadas)
+    es_nucleo = arbol.query_ball_point(coordenadas, radio, return_length=True) >= min_samples
     etiquetas = np.full(len(coordenadas), -1, dtype=int)
     nucleos_procesados = np.zeros(len(coordenadas), dtype=bool)
     cluster = 0
@@ -160,7 +125,7 @@ def dbscan_coordenadas(
         etiquetas[inicio] = cluster
         while pendientes:
             actual = pendientes.pop()
-            for vecino in vecinos[actual]:
+            for vecino in sorted(arbol.query_ball_point(coordenadas[actual], radio)):
                 if etiquetas[vecino] == -1:
                     etiquetas[vecino] = cluster
                 if es_nucleo[vecino] and not nucleos_procesados[vecino]:
@@ -239,6 +204,7 @@ class SelectorMuestra:
         avisar(0.05, "Leyendo universo elegible...")
         pais_act = getattr(self, "pais_activo", cfg.get("pais_activo", ""))
         res.pais_activo = pais_act
+        cfg["pais_activo"] = pais_act
         paises_exentos = ["REPÚBLICA DOMINICANA", "REPUBLICA DOMINICANA", "ECUADOR", "CHILE"]
         res.nueva_regla = pais_act.strip().upper() not in paises_exentos
         if res.nueva_regla:
@@ -944,8 +910,6 @@ class SelectorMuestra:
         else:
             # La cuerda de una esfera y la distancia haversine tienen el mismo
             # orden. El árbol encuentra el vecino sin crear una matriz N×N.
-            from scipy.spatial import cKDTree
-
             lat_rad = np.radians(lat)
             lon_rad = np.radians(lon)
             puntos = np.column_stack((

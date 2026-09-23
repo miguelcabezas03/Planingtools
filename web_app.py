@@ -48,10 +48,11 @@ from reportes import _generar_pdf
 from server_config_store import load_configuration, save_configuration
 from utilidades import VERSION
 from web_workflow import (
-    parse_priority_codes,
+    parse_priority_codes, selection_source_options,
     synchronize_country_parameters,
     workbook_columns,
     workbook_record,
+    write_spreadsheet,
     write_workbook,
 )
 from web_polygons import polygon_record, write_latam_zip, write_sample_gpkg
@@ -82,7 +83,7 @@ NAV_MODULES = (
 
 WORKFLOW_RESULT_KEYS = (
     "dep_result", "dep_result_country", "dep_zip", "sel_review", "sel_source_id",
-    "sel_result", "sel_result_source_id", "sel_xlsx", "sel_zip",
+    "sel_result", "sel_result_source_id", "sel_xlsx", "sel_zip", "sel_review_xlsx",
 )
 
 
@@ -246,7 +247,9 @@ def progress_callback(bar):
 def map_points(df: pd.DataFrame, lat_col: str, lon_col: str, *, draw: bool = False, key: str = "map"):
     lat = pd.to_numeric(df[lat_col], errors="coerce")
     lon = pd.to_numeric(df[lon_col], errors="coerce")
-    valid = df.loc[lat.between(-90, 90) & lon.between(-180, 180)].copy()
+    valid = pd.DataFrame({lat_col: lat, lon_col: lon}).loc[
+        lat.between(-90, 90) & lon.between(-180, 180)
+    ]
     if valid.empty:
         st.info("No hay coordenadas válidas para mostrar.")
         return {}
@@ -600,15 +603,18 @@ def page_selection() -> None:
     country = cfg["pais_activo"]
     uploaded = st.file_uploader("Universo elegible Excel (alternativa a Depuración)", type=["xlsx", "xlsm"], key=f"sel_input_{country}")
     saved_inputs = st.session_state.setdefault("selection_workbooks", {})
+    new_upload = False
     if uploaded is not None:
         try:
             candidate = workbook_record(uploaded.name, uploaded.getvalue())
             if saved_inputs.get(country, {}).get("fingerprint") != candidate["fingerprint"]:
                 saved_inputs[country] = candidate
+                new_upload = True
                 st.session_state.pop("sel_review", None)
                 st.session_state.pop("sel_result", None)
                 st.session_state.pop("sel_xlsx", None)
                 st.session_state.pop("sel_zip", None)
+                st.session_state.pop("sel_review_xlsx", None)
         except ValueError as exc:
             show_error(exc)
     input_record = saved_inputs.get(country)
@@ -616,21 +622,27 @@ def page_selection() -> None:
         st.caption(f"Archivo de selección en esta sesión: {input_record['name']}")
     use_previous = (st.session_state.get("dep_result") is not None and
                     st.session_state.get("dep_result_country") == country)
-    if use_previous:
-        st.info("También puedes usar el universo generado en Depuración durante esta sesión.")
-    source = st.radio(
-        "Origen",
-        ["Archivo cargado", "Resultado de depuración"] if use_previous else ["Archivo cargado"],
-        horizontal=True, key=f"sel_source_{country}",
-    )
+    source_options = selection_source_options(use_previous, input_record is not None)
+    source_key = f"sel_source_{country}"
+    if new_upload:
+        st.session_state[source_key] = "Archivo cargado"
+    elif st.session_state.get(source_key) not in source_options:
+        st.session_state.pop(source_key, None)
+    if source_options:
+        source = st.radio("Origen", source_options, horizontal=True, key=source_key)
+    else:
+        source = None
+        st.warning(
+            "No hay un universo elegible disponible para este país. "
+            "Primero ejecuta Depuración o sube aquí el Excel del universo elegible. "
+            "Los nombres guardados en Configuración no cargan por sí solos los archivos en esta sesión."
+        )
     source_id = (
         country, source,
         id(st.session_state.dep_result) if source == "Resultado de depuración" else
         input_record["fingerprint"] if input_record else None,
     )
-    if source_id != st.session_state.get("sel_source_id") and (
-        source == "Resultado de depuración" or input_record
-    ):
+    if source is not None and source_id != st.session_state.get("sel_source_id"):
         try:
             st.session_state.sel_review = (
                 st.session_state.dep_result.elegibles.copy()
@@ -641,15 +653,18 @@ def page_selection() -> None:
             st.session_state.pop("sel_result", None)
             st.session_state.pop("sel_xlsx", None)
             st.session_state.pop("sel_zip", None)
+            st.session_state.pop("sel_review_xlsx", None)
         except Exception as exc:
             show_error(exc)
     review = st.session_state.get("sel_review")
     if review is not None and source_id == st.session_state.get("sel_source_id"):
+        st.success(f"Universo listo: {len(review):,} puntos · {source} · {country}.")
         sel_cfg = cfg["paises"][country]["modulo_seleccion"]
         lat, lon = sel_cfg.get("columna_lat"), sel_cfg.get("columna_lon")
         with st.expander("Revisión geográfica", expanded=False):
             if lat in review and lon in review:
-                state = map_points(review, lat, lon, draw=True, key="sel_review_map")
+                show_map = st.checkbox("Mostrar mapa para revisar áreas", key=f"sel_show_map_{country}")
+                state = map_points(review, lat, lon, draw=True, key="sel_review_map") if show_map else None
                 drawings = (state or {}).get("all_drawings", [])
                 choice = st.selectbox(
                     "Estado para los puntos dentro del área",
@@ -661,17 +676,23 @@ def page_selection() -> None:
                         review["ELEGIBLE"] = "ELEGIBLE"
                     review.loc[selected, "ELEGIBLE"] = choice
                     st.session_state.sel_review = review
+                    st.session_state.pop("sel_review_xlsx", None)
                     st.success(f"{int(selected.sum()):,} puntos actualizados.")
             else:
                 st.warning("Las columnas GPS configuradas no están en el universo.")
             st.dataframe(review.head(500), width="stretch")
-            st.download_button(
-                "Descargar revisión geográfica",
-                spreadsheet_bytes({"Revision Geografica": review}),
+            if st.button("Preparar Excel de revisión", key=f"prepare_sel_review_{country}"):
+                with st.spinner("Preparando el archivo de revisión..."):
+                    st.session_state.sel_review_xlsx = spreadsheet_bytes({"Revision Geografica": review})
+            download_result(
+                "sel_review_xlsx", "Descargar revisión geográfica",
                 "Revision_Geografica.xlsx",
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-    if st.button("Seleccionar muestra", type="primary", disabled=st.session_state.get("sel_review") is None or source_id != st.session_state.get("sel_source_id")):
+    ready = review is not None and source_id == st.session_state.get("sel_source_id")
+    if source is not None and not ready:
+        st.info("No se pudo preparar el universo elegible. Revisa el archivo o el resultado de Depuración antes de seleccionar.")
+    if st.button("Seleccionar muestra", type="primary", disabled=not ready):
         try:
             universe = st.session_state.sel_review
             with tempfile.TemporaryDirectory(prefix="planning-sel-") as temp:
@@ -679,15 +700,17 @@ def page_selection() -> None:
                 selector.pais_activo = country
                 bar = st.progress(0, text="Preparando muestra...")
                 result = selector.ejecutar(progress_callback(bar), universo=universe)
-                files = {
-                    "Seleccion.xlsx": spreadsheet_bytes({
-                        "Titulares": result.titulares,
-                        "Suplentes": result.suplentes,
-                        "Auditoria": pd.DataFrame(list(result.metricas.items()), columns=["Indicador", "Valor"]),
-                    }),
-                    "Universo_Revisado.xlsx": spreadsheet_bytes({"Universo": result.universo_revisado}),
-                }
-                pdf_path = Path(temp) / f"Resumen_{country.replace(' ', '_')}.pdf"
+                temp_path = Path(temp)
+                selection_path = temp_path / "Seleccion.xlsx"
+                write_spreadsheet(selection_path, {
+                    "Titulares": result.titulares,
+                    "Suplentes": result.suplentes,
+                    "Auditoria": pd.DataFrame(list(result.metricas.items()), columns=["Indicador", "Valor"]),
+                })
+                reviewed_path = temp_path / "Universo_Revisado.xlsx"
+                write_spreadsheet(reviewed_path, {"Universo": result.universo_revisado})
+                output_paths = [selection_path, reviewed_path]
+                pdf_path = temp_path / f"Resumen_{country.replace(' ', '_')}.pdf"
                 try:
                     pdf_result = copy.copy(result)
                     pdf_result.pais_activo = country
@@ -697,13 +720,17 @@ def page_selection() -> None:
                         **result.metricas,
                     }
                     _generar_pdf(pdf_result, pdf_path)
-                    files[pdf_path.name] = pdf_path.read_bytes()
+                    output_paths.append(pdf_path)
                 except Exception as exc:
                     st.warning(f"No se pudo generar el PDF consolidado: {exc}")
                 st.session_state.sel_result = result
                 st.session_state.sel_result_source_id = source_id
-                st.session_state.sel_xlsx = files["Seleccion.xlsx"]
-                st.session_state.sel_zip = zip_outputs(files)
+                zip_path = temp_path / "Seleccion.zip"
+                with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+                    for output_path in output_paths:
+                        bundle.write(output_path, arcname=output_path.name)
+                st.session_state.sel_zip = zip_path.read_bytes()
+                st.session_state.sel_xlsx = selection_path.read_bytes()
                 st.success(f"Selección terminada: {len(result.titulares):,} titulares y {len(result.suplentes):,} suplentes.")
         except Exception as exc:
             show_error(exc)
