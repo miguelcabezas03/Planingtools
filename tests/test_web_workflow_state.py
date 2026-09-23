@@ -7,6 +7,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from openpyxl import load_workbook
 
 from server_config_store import load_configuration, save_configuration
 from web_workflow import (
@@ -78,6 +79,11 @@ class WorkflowStateTests(unittest.TestCase):
             with pd.ExcelFile(output) as workbook:
                 self.assertEqual(workbook.sheet_names, ["Titulares", "Suplentes"])
             pd.testing.assert_frame_equal(pd.read_excel(output, sheet_name="Titulares"), data)
+            workbook = load_workbook(output, read_only=True)
+            try:
+                self.assertIsNone(workbook["Titulares"]["C3"].value)
+            finally:
+                workbook.close()
 
     def test_shared_server_save_reload_and_conflict(self):
         with tempfile.TemporaryDirectory() as temp:

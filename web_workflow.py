@@ -68,10 +68,10 @@ def write_spreadsheet(path: Path, frames: dict[str, pd.DataFrame]) -> None:
         for values in frame.itertuples(index=False, name=None):
             row = []
             for value in values:
-                if value is None or value is pd.NA:
+                if value is None or value is pd.NA or value is pd.NaT:
                     value = None
                 elif isinstance(value, (float, np.floating)) and not math.isfinite(value):
-                    value = str(value)
+                    value = None if math.isnan(value) else str(value)
                 elif isinstance(value, np.generic):
                     value = value.item()
                 elif isinstance(value, pd.Timestamp):
